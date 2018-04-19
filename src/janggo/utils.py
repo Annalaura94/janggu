@@ -4,6 +4,8 @@ import os
 import sys
 import parser
 import symbol
+import importlib
+import inspect
 from collections import defaultdict
 
 import numpy as np
@@ -217,6 +219,7 @@ def get_genome_size_from_bed(bedfile, flank):
 
 
 def _get_name(ptree):
+    """Function parses the parse tree and extracts function definitions."""
     #if isinstance(ptree, list) and ptree[0] == symbol.parameters:
     # symbols have changed in python 2 and 3
     if isinstance(ptree, list) and \
@@ -232,36 +235,35 @@ def _get_name(ptree):
         return None
 
 
-def get_parse_tree(modelzoo):
+def get_parse_tree(func):
     """Function parses the modelzoo.
 
-    This function parses the model tree. It returns a dictionary
+    This function returns a dictionary
     with modelnames as keys and its respective definition as value.
     The parsed model definitions will allow to create unique modelnames
     whenever the model definition has changed.
 
+    .. note:: Function definition
+       The function definition can only be hashed in python 3.
+       Due to the bug (Issue: 1764286) in inspect.getsource,
+       decorated functions are parsed incorrectly in python 2.
+
     Parameters
     ----------
-    modelzoo : str
-        Python script containing the models.
+    func : python function
+        Python function.
 
     Returns
     -------
     dict :
         Dictionary containing modelnames as keys and modeldefinition as values.
     """
-    content = open(modelzoo).read()
-    st = parser.suite(content)
-    stl = st.tolist()
 
-    parsetree = {}
-    for element in stl:
-        #if isinstance(element, list) and element[0] == symbol.small_stmt:
-        if isinstance(element, list) and \
-            element[0] in [symbol.small_stmt, symbol.stmt]:
-            fname = _get_name(element)
-            if fname:
-                print(fname)
-                parsetree[fname] = element
+    if sys.version_info[0] > 2:
+        content = inspect.getsource(func)
 
-    return parsetree
+        st_ = parser.suite(content)
+        value = st_.tolist()
+    else:
+        value = func
+    return {func.__name__: value}
