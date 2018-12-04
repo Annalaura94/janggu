@@ -8,6 +8,7 @@ from janggu.data.genomicarray import GenomicArray  # noqa
 from janggu.data.genomicarray import create_genomic_array  # noqa
 from janggu.data.nparr import Array  # noqa
 from janggu.data.tab import Table  # noqa
+from janggu.data.coverage import plotGenomeTrack
 
 
 def split_train_test(dataset, holdout_chroms):
@@ -30,16 +31,16 @@ def split_train_test(dataset, holdout_chroms):
         raise ValueError("Unknown dataset type: {}".format(type(dataset)))
 
     gind = dataset.gindexer
-    gind_train = gind.filter_by_chrom(exclude=holdout_chroms)
-    gind_test = gind.filter_by_chrom(include=holdout_chroms)
+    gind_train = gind.filter_by_region(exclude=holdout_chroms)
+    gind_test = gind.filter_by_region(include=holdout_chroms)
     if isinstance(dataset, Cover):
         traindata = Cover(dataset.name, dataset.garray, gind_train,
-                          dataset.padding_value, dataset.dimmode)
+                          dataset.padding_value, dataset.dimmode, dataset._channel_last)
         testdata = Cover(dataset.name, dataset.garray, gind_test,
-                         dataset.padding_value, dataset.dimmode)
+                         dataset.padding_value, dataset.dimmode, dataset._channel_last)
     elif isinstance(dataset, Bioseq):
         traindata = Bioseq(dataset.name, dataset.garray, gind_train,
-                           dataset._alphabetsize)
+                           dataset._alphabetsize, dataset._channel_last)
         testdata = Bioseq(dataset.name, dataset.garray, gind_test,
-                          dataset._alphabetsize)
+                          dataset._alphabetsize, dataset._channel_last)
     return traindata, testdata

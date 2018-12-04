@@ -3,6 +3,7 @@
 import json
 import os
 from collections import defaultdict
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,8 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from HTSeq import BED_Reader
 from HTSeq import GFF_Reader
+from HTSeq import GenomicFeature
+from HTSeq import GenomicInterval
 
 try:
     import matplotlib.pyplot as plt  # pylint: disable=import-error
@@ -154,12 +157,13 @@ def sequence_padding(seqs, length):
     list(Bio.SeqRecord)
         Padded sequence represented as string, SeqRecord or Seq.
     """
-    for idx, seq in enumerate(seqs):
+    seqs_ = deepcopy(seqs)
+    for idx, seq in enumerate(seqs_):
         if len(seq) < length:
-            seqs[idx] += '.' * (length - len(seq))
+            seqs_[idx] += '.' * (length - len(seq))
         else:
-            seqs[idx] = seq[:length]
-    return seqs
+            seqs_[idx] = seq[:length]
+    return seqs_
 
 
 def as_onehot(iseq, order, alphabetsize):
@@ -286,10 +290,12 @@ def _get_genomic_reader(filename):
 
 
 def _iv_to_str(chrom, start, end):
+    """Converts a genomic interval into a string representation 'chr:start-end'."""
     return '{}:{}-{}'.format(chrom, start, end)
 
 
 def _str_to_iv(givstr, template_extension):
+    """Converts a string representation 'chr:start-end' into genomic coordinates."""
     sub = givstr.split(':')
     if len(sub) == 1:
         return (sub[0], )
@@ -300,7 +306,12 @@ def _str_to_iv(givstr, template_extension):
     return (chr_, start - template_extension, end + template_extension)
 
 
-def get_genome_size_from_bed(bedfile):
+def get_chrom_length(length, resolution):
+    """obtain the chromosome length for a given resolution."""
+    return int(np.ceil(length/resolution))
+
+
+def get_genome_size_from_regions(regions):
     """Get genome size.
 
     This function loads the genome size for a specified reference genome
@@ -309,8 +320,9 @@ def get_genome_size_from_bed(bedfile):
 
     Parameters
     ----------
-    bedfile : str
-        Bed or GFF file containing the regions of interest
+    regions : str or GenomicIndexer
+        Either a path pointing to a BED or GFF file containing genomic regions
+        or a GenomicIndexer object.
 
     Returns
     -------
@@ -319,14 +331,20 @@ def get_genome_size_from_bed(bedfile):
         as values.
     """
 
-    regions_ = _get_genomic_reader(bedfile)
+    regions_ = regions
+    if isinstance(regions, str):
+        regions_ = _get_genomic_reader(regions)
 
     gsize = {}
     for region in regions_:
-        if region.iv.chrom not in gsize:
-            gsize[region.iv.chrom] = region.iv.end
-        elif gsize[region.iv.chrom] < region.iv.end:
-            gsize[region.iv.chrom] = region.iv.end
+        if isinstance(region, GenomicFeature):
+            iv = region.iv
+        elif isinstance(region, GenomicInterval):
+            iv = region
+        if iv.chrom not in gsize:
+            gsize[iv.chrom] = iv.end
+        elif gsize[iv.chrom] < iv.end:
+            gsize[iv.chrom] = iv.end
     return gsize
 
 

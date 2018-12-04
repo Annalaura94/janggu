@@ -11,7 +11,13 @@ from janggu.data.genomicarray import create_genomic_array
 from janggu.utils import _get_genomic_reader
 from janggu.utils import _iv_to_str
 from janggu.utils import _str_to_iv
-from janggu.utils import get_genome_size_from_bed
+from janggu.utils import get_genome_size_from_regions
+from janggu.utils import get_chrom_length
+
+import matplotlib.pyplot as plt
+from matplotlib import style
+from matplotlib.gridspec import GridSpec
+from matplotlib.pyplot import cm
 
 try:
     import pyBigWig
@@ -55,12 +61,13 @@ class Cover(Dataset):
     def __init__(self, name, garray,
                  gindexer,  # indices of pointing to region start
                  padding_value,
-                 dimmode):  # padding value
+                 dimmode, channel_last):  # padding value
 
         self.garray = garray
         self.gindexer = gindexer
         self.padding_value = padding_value
         self.dimmode = dimmode
+        self._channel_last = channel_last
 
         Dataset.__init__(self, name)
 
@@ -83,7 +90,8 @@ class Cover(Dataset):
                         aggregate=None,
                         datatags=None,
                         cache=False,
-                        load_whole_genome=False):
+                        channel_last=True,
+                        store_whole_genome=False):
         """Create a Cover class from a bam-file (or files).
 
         This constructor can be used to obtain coverage from BAM files.
@@ -103,13 +111,11 @@ class Cover(Dataset):
             If set to None, the coverage will be
             fetched from the entire genome and a
             genomic indexer must be attached later.
-            Otherwise, the coverage is only determined
-            for the region of interest.
         genomesize : dict or None
-            Dictionary containing the genome size to fetch the coverage from.
+            Dictionary containing the genome size.
             If `genomesize=None`, the genome size
-            is fetched from the region of interest or the bam header.
-            Otherwise, the supplied genome size is used.
+            is determined from the bam header.
+            If `store_whole_genome=False`, this option does not have an effect.
         conditions : list(str) or None
             List of conditions.
             If `conditions=None`,
@@ -173,10 +179,14 @@ class Cover(Dataset):
             Default: None
         cache : boolean
             Indicates whether to cache the dataset. Default: False.
-        load_whole_genome : boolean
-            Indicates whether the whole genome or all selected chromosomes
+        channel_last : boolean
+            Indicates whether the condition axis should be the last dimension
+            or the first. For example, tensorflow expects the channel at the
+            last position. Default: True.
+        store_whole_genome : boolean
+            Indicates whether the whole genome or only selected regions
             should be loaded. If False, a bed-file with regions of interest
-            must be specified.
+            must be specified. Default: False
         """
 
         if pysam is None:  # pragma: no cover
@@ -198,10 +208,10 @@ class Cover(Dataset):
         if min_mapq is None:
             min_mapq = 0
 
-        full_genome_index = load_whole_genome
+        full_genome_index = store_whole_genome
 
         if not full_genome_index and not gindexer:
-            raise ValueError('Either regions must be supplied or load_whole_genome must be True')
+            raise ValueError('Either regions must be supplied or store_whole_genome must be True')
 
         if not full_genome_index:
             # if whole genome should not be loaded
@@ -227,9 +237,14 @@ class Cover(Dataset):
                 aln_file = pysam.AlignmentFile(sample_file, 'rb')  # pylint: disable=no-member
                 for chrom in gsize:
 
-                    array = np.zeros((gsize[chrom]//resolution, 2), dtype=dtype)
+                    array = np.zeros((get_chrom_length(gsize[chrom], resolution),
+                                     2), dtype=dtype)
 
                     locus = _str_to_iv(chrom, template_extension=template_extension)
+                    if len(locus) == 1:
+                        locus = (locus[0], 0, gsize[chrom])
+                    # locus = (chr, start, end)
+                    # or locus = (chr, )
 
                     for aln in aln_file.fetch(*locus):
 
@@ -279,7 +294,7 @@ class Cover(Dataset):
                             else:
                                 pos = aln.reference_start
 
-                        if len(locus) == 3:
+                        if not garray._full_genome_stored:
                             # if we get here, a region was given,
                             # otherwise, the entire chromosome is read.
                             pos -= locus[1] + template_extension
@@ -302,15 +317,14 @@ class Cover(Dataset):
                         array = aggregate(array)
 
                     if stranded:
-                        garray[GenomicInterval(chrom, 0, gsize[chrom],
-                                               '+'), i] = array[:, 0]
-                        garray[GenomicInterval(chrom, 0, gsize[chrom],
-                                               '-'), i] = array[:, 1]
+                        lp = locus + ('+',)
+                        garray[GenomicInterval(*lp), i] = array[:, 0]
+                        lm = locus + ('-',)
+                        garray[GenomicInterval(*lm), i] = array[:, 1]
                     else:
                         # if unstranded, aggregate the reads from
                         # both strands
-                        garray[GenomicInterval(chrom, 0, gsize[chrom],
-                                               '.'), i] = array.sum(axis=1)
+                        garray[GenomicInterval(*locus), i] = array.sum(axis=1)
 
             return garray
 
@@ -324,12 +338,13 @@ class Cover(Dataset):
                                      conditions=conditions,
                                      overwrite=overwrite,
                                      typecode=dtype,
+                                     store_whole_genome=store_whole_genome,
                                      resolution=resolution,
                                      loader=_bam_loader,
                                      loader_args=(bamfiles,))
-        cover._full_genome_stored = full_genome_index
 
-        return cls(name, cover, gindexer, padding_value=0, dimmode='all')
+        return cls(name, cover, gindexer, padding_value=0, dimmode='all',
+                   channel_last=channel_last)
 
     @classmethod
     def create_from_bigwig(cls, name,  # pylint: disable=too-many-locals
@@ -338,14 +353,16 @@ class Cover(Dataset):
                            genomesize=None,
                            conditions=None,
                            binsize=None, stepsize=None,
-                           resolution=200,
+                           resolution=1,
                            flank=0, storage='ndarray',
                            dtype='float32',
                            overwrite=False,
                            dimmode='all',
                            aggregate=np.mean,
                            datatags=None, cache=False,
-                           load_whole_genome=False):
+                           store_whole_genome=False,
+                           channel_last=True,
+                           nan_to_num=True):
         """Create a Cover class from a bigwig-file (or files).
 
         Parameters
@@ -362,9 +379,10 @@ class Cover(Dataset):
             Otherwise, the coverage is only determined
             for the region of interest.
         genomesize : dict or None
-            Dictionary containing the genome size to fetch the coverage from.
+            Dictionary containing the genome size.
             If `genomesize=None`, the genome size
-            is fetched from the region of interest or the bigwig files.
+            is determined from the bigwig file.
+            If `store_whole_genome=False`, this option does not have an effect.
         conditions : list(str) or None
             List of conditions.
             If `conditions=None`,
@@ -416,10 +434,17 @@ class Cover(Dataset):
             Default: numpy.mean
         cache : boolean
             Indicates whether to cache the dataset. Default: False.
-        load_whole_genome : boolean
-            Indicates whether the whole genome or all selected chromosomes
+        store_whole_genome : boolean
+            Indicates whether the whole genome or only selected regions
             should be loaded. If False, a bed-file with regions of interest
             must be specified. Default: False.
+        channel_last : boolean
+            Indicates whether the condition axis should be the last dimension
+            or the first. For example, tensorflow expects the channel at the
+            last position. Default: True.
+        nan_to_num : boolean
+            Indicates whether NaN values contained in the bigwig files should
+            be interpreted as zeros. Default: True
         """
         if pyBigWig is None:  # pragma: no cover
             raise Exception('pyBigWig not available. '
@@ -433,12 +458,10 @@ class Cover(Dataset):
         if isinstance(bigwigfiles, str):
             bigwigfiles = [bigwigfiles]
 
-        full_genome_index = load_whole_genome
+        if not store_whole_genome and not gindexer:
+            raise ValueError('Either regions must be supplied or store_whole_genome must be True')
 
-        if not full_genome_index and not gindexer:
-            raise ValueError('Either regions must be supplied or load_whole_genome must be True')
-
-        if not full_genome_index:
+        if not store_whole_genome:
             # if whole genome should not be loaded
             gsize = {_iv_to_str(iv.chrom, iv.start,
                                 iv.end): iv.end-iv.start for iv in gindexer}
@@ -463,29 +486,31 @@ class Cover(Dataset):
 
                 for chrom in gsize:
 
-                    vals = np.empty((gsize[chrom]//resolution),
+                    vals = np.zeros((get_chrom_length(gsize[chrom], resolution), ),
                                     dtype=dtype)
 
                     locus = _str_to_iv(chrom, template_extension=0)
-
                     if len(locus) == 1:
-                        for start in range(0, gsize[chrom], resolution):
+                        locus = locus + (0, gsize[chrom])
 
-                            vals[start//resolution] = aggregate(np.asarray(bwfile.values(
-                                chrom,
-                                int(start),
-                                int(min((start+resolution), gsize[chrom])))))
+                    # when only to load parts of the genome
+                    for start in range(locus[1], locus[2], resolution):
 
-                    else:
-                        for start in range(locus[1], locus[2], resolution):
-                            vals[(start - locus[1])//resolution] = \
-                                aggregate(np.asarray(bwfile.values(
-                                          locus[0],
-                                          int(start),
-                                          int(start+resolution))))
-                        # not sure what to do with nan yet.
+                        if garray._full_genome_stored:
+                            # be careful not to overshoot at the chromosome end
+                            end = min(start+resolution, gsize[chrom])
+                        else:
+                            end = start + resolution
 
-                    garray[GenomicInterval(chrom, 0, gsize[chrom]), i] = vals
+                        x = np.asarray(bwfile.values(
+                            locus[0],
+                            int(start),
+                            int(end)))
+                        if nan_to_num:
+                            x = np.nan_to_num(x, copy=False)
+                        vals[(start - locus[1])//resolution] = aggregate(x)
+
+                    garray[GenomicInterval(*locus), i] = vals
             return garray
 
         datatags = [name] + datatags if datatags else [name]
@@ -497,13 +522,13 @@ class Cover(Dataset):
                                      conditions=conditions,
                                      overwrite=overwrite,
                                      resolution=resolution,
+                                     store_whole_genome=store_whole_genome,
                                      typecode=dtype,
                                      loader=_bigwig_loader,
                                      loader_args=(aggregate,))
-        cover._full_genome_stored = full_genome_index
 
         return cls(name, cover, gindexer,
-                   padding_value=0, dimmode=dimmode)
+                   padding_value=0, dimmode=dimmode, channel_last=channel_last)
 
     @classmethod
     def create_from_bed(cls, name,  # pylint: disable=too-many-locals
@@ -517,7 +542,9 @@ class Cover(Dataset):
                         dtype='int',
                         dimmode='all',
                         mode='binary',
+                        store_whole_genome=False,
                         overwrite=False,
+                        channel_last=True,
                         datatags=None, cache=False):
         """Create a Cover class from a bed-file (or files).
 
@@ -584,6 +611,14 @@ class Cover(Dataset):
             the datatags are used to construct a cache file.
             If :code:`cache=False`, this option does not have an effect.
             Default: None.
+        store_whole_genome : boolean
+            Indicates whether the whole genome or only selected regions
+            should be loaded. If False, a bed-file with regions of interest
+            must be specified. Default: False.
+        channel_last : boolean
+            Indicates whether the condition axis should be the last dimension
+            or the first. For example, tensorflow expects the channel at the
+            last position. Default: True.
         cache : boolean
             Indicates whether to cache the dataset. Default: False.
         """
@@ -597,11 +632,19 @@ class Cover(Dataset):
         else:
             gindexer = None
 
-        # automatically determine genomesize from largest region
-        if not genomesize:
-            gsize = get_genome_size_from_bed(regions)
+        if not store_whole_genome:
+            # if whole genome should not be loaded
+            gsize = {_iv_to_str(iv.chrom, iv.start,
+                                iv.end): iv.end-iv.start for iv in gindexer}
+
         else:
-            gsize = genomesize.copy()
+            # otherwise the whole genome will be fetched, or at least
+            # a set of full length chromosomes
+            if genomesize is not None:
+                # if a genome size has specifically been given, use it.
+                gsize = genomesize.copy()
+            else:
+                gsize = get_genome_size_from_regions(regions)
 
         if isinstance(bedfiles, str):
             bedfiles = [bedfiles]
@@ -626,37 +669,35 @@ class Cover(Dataset):
         def _bed_loader(garray, bedfiles, genomesize, mode):
             print("load from bed")
             for i, sample_file in enumerate(bedfiles):
-                print(sample_file)
                 regions_ = _get_genomic_reader(sample_file)
 
                 for region in regions_:
-                    if region.iv.chrom not in genomesize:
-                        continue
+                    gidx = GenomicIndexer.create_from_region(
+                        region.iv.chrom,
+                        region.iv.start,
+                        region.iv.end, region.iv.strand,
+                        binsize, stepsize, flank)
+                    for greg in gidx:
 
-                    if genomesize[region.iv.chrom] <= region.iv.start:
-                        print('Region {} outside of '.format(region.iv) +
-                              'genome size - skipped')
-                    else:
                         if region.score is None and mode in ['score',
                                                              'categorical']:
                             raise ValueError(
-                                'No score field must present in {}'.format(sample_file) + \
+                                'No Score available. Score field must '
+                                'present in {}'.format(sample_file) + \
                                 'for mode="{}"'.format(mode))
                         # if region score is not defined, take the mere
                         # presence of a range as positive label.
                         if mode == 'score':
-                            garray[region.iv,
-                                   i] = np.dtype(dtype).type(region.score)
+                            garray[greg, i] = np.dtype(dtype).type(region.score)
                         elif mode == 'categorical':
-                            garray[region.iv,
+                            garray[greg,
                                    int(region.score)] = np.dtype(dtype).type(1)
                         elif mode == 'binary':
-                            garray[region.iv,
-                                   i] = np.dtype(dtype).type(1)
+                            garray[greg, i] = np.dtype(dtype).type(1)
             return garray
 
         # At the moment, we treat the information contained
-        # in each bw-file as unstranded
+        # in each bed-file as unstranded
 
         datatags = [name] + datatags if datatags else [name]
         datatags += ['resolution{}'.format(resolution)]
@@ -668,11 +709,153 @@ class Cover(Dataset):
                                      resolution=resolution,
                                      overwrite=overwrite,
                                      typecode=dtype,
+                                     store_whole_genome=store_whole_genome,
                                      loader=_bed_loader,
                                      loader_args=(bedfiles, gsize, mode))
 
         return cls(name, cover, gindexer,
-                   padding_value=0, dimmode=dimmode)
+                   padding_value=0, dimmode=dimmode, channel_last=channel_last)
+
+    @classmethod
+    def create_from_array(cls, name,  # pylint: disable=too-many-locals
+                          array,
+                          gindexer,
+                          genomesize=None,
+                          conditions=None,
+                          resolution=1,
+                          storage='ndarray',
+                          overwrite=False,
+                          datatags=None,
+                          cache=False,
+                          channel_last=True,
+                          store_whole_genome=False):
+        """Create a Cover class from a numpy.array.
+
+        The purpose of this function is to convert output prediction from
+        keras which are in numpy.array format into a Cover object.
+
+        Parameters
+        -----------
+        name : str
+            Name of the dataset
+        array : numpy.array
+            A 4D numpy array that will be re-interpreted as genomic array.
+        gindexer : GenomicIndexer
+            Genomic indices associated with the values contained in array.
+        genomesize : dict or None
+            Dictionary containing the genome size to fetch the coverage from.
+            If `genomesize=None`, the genome size is automatically determined
+            from the GenomicIndexer. If `store_whole_genome=False` this
+            option does not have an effect.
+        conditions : list(str) or None
+            List of conditions.
+            If `conditions=None`,
+            the conditions are obtained from
+            the filenames (without the directories
+            and file-ending).
+        resolution : int
+            Resolution in base pairs divides the region of interest
+            in windows of length resolution.
+            This effectively reduces the storage for coverage data.
+            The resolution must be selected such that min(stepsize, binsize)
+            is a multiple of resolution.
+            Default: 1.
+        storage : str
+            Storage mode for storing the coverage data can be
+            'ndarray', 'hdf5' or 'sparse'. Default: 'ndarray'.
+        overwrite : boolean
+            Overwrite cachefiles. Default: False.
+        datatags : list(str) or None
+            List of datatags. Together with the dataset name,
+            the datatags are used to construct a cache file.
+            If :code:`cache=False`, this option does not have an effect.
+            Default: None.
+        cache : boolean
+            Indicates whether to cache the dataset. Default: False.
+        store_whole_genome : boolean
+            Indicates whether the whole genome or only selected regions
+            should be loaded. Default: False.
+        channel_last : boolean
+            This tells the constructor how to interpret the array dimensions.
+            It indicates whether the condition axis is the last dimension
+            or the first. For example, tensorflow expects the channel at the
+            last position. Default: True.
+        """
+
+        if not store_whole_genome:
+            # if whole genome should not be loaded
+            gsize = {_iv_to_str(iv.chrom, iv.start,
+                                iv.end): iv.end-iv.start for iv in gindexer}
+        elif genomesize:
+            gsize = genomesize.copy()
+        else:
+            # if not supplied, determine the genome size automatically
+            # based on the gindexer intervals.
+            gsize = get_genome_size_from_regions(gindexer)
+
+        if not channel_last:
+            array = np.transpose(array, (0, 3, 1, 2))
+
+        if conditions is None:
+            conditions = ["Cond_{}".format(i) for i in range(array.shape[-1])]
+
+        # check if dimensions of gindexer and array match
+        if len(gindexer) != array.shape[0]:
+            raise ValueError("Data incompatible: "
+                "The number intervals in gindexer"
+                " must match the number of datapoints in the array "
+                "(len(gindexer) != array.shape[0])")
+
+        if store_whole_genome:
+            # in this case the intervals must be non-overlapping
+            # in order to obtain unambiguous data.
+            if gindexer.binsize > gindexer.stepsize:
+                raise ValueError("Overlapping intervals: "
+                    "With overlapping intervals the mapping between "
+                    "the array and genomic-array values is ambiguous. "
+                    "Please ensure that binsize <= stepsize.")
+
+        # determine the resolution
+        resolution = gindexer[0].length // array.shape[1]
+
+        # determine strandedness
+        stranded = True if array.shape[2] == 2 else False
+
+        def _array_loader(garray, array, gindexer):
+            print("load from array")
+
+            for i, region in enumerate(gindexer):
+                iv = region
+                for cond in range(array.shape[-1]):
+                    if stranded:
+                        iv.strand = '+'
+                        garray[iv, cond] = array[i, :, 0, cond].astype(dtype)
+                        iv.strand = '-'
+                        garray[iv, cond] = array[i, :, 1, cond].astype(dtype)
+                    else:
+                        garray[iv, cond] = array[i, :, 0, cond]
+
+            return garray
+
+        # At the moment, we treat the information contained
+        # in each bw-file as unstranded
+
+        datatags = [name] + datatags if datatags else [name]
+        datatags += ['resolution{}'.format(resolution)]
+
+        cover = create_genomic_array(gsize, stranded=stranded,
+                                     storage=storage, datatags=datatags,
+                                     cache=cache,
+                                     conditions=conditions,
+                                     resolution=resolution,
+                                     overwrite=overwrite,
+                                     typecode=array.dtype,
+                                     store_whole_genome=store_whole_genome,
+                                     loader=_array_loader,
+                                     loader_args=(array, gindexer))
+
+        return cls(name, cover, gindexer,
+                   padding_value=0, dimmode='all', channel_last=channel_last)
 
     @property
     def gindexer(self):
@@ -697,12 +880,7 @@ class Cover(Dataset):
 
     def __getitem__(self, idxs):
         if isinstance(idxs, tuple):
-            if len(idxs) == 3 or len(idxs) == 4:
-                # interpret idxs as genomic interval
-                idxs = GenomicInterval(*idxs)
-            else:
-                raise ValueError('idxs cannot be interpreted as genomic interval.'
-                                 ' use (chr, start, end) or (chr, start, end, strand)')
+            idxs = GenomicInterval(*idxs)
 
         if isinstance(idxs, int):
             idxs = [idxs]
@@ -711,14 +889,48 @@ class Cover(Dataset):
                          idxs.stop if idxs.stop else len(self),
                          idxs.step if idxs.step else 1)
         elif isinstance(idxs, GenomicInterval):
-            if not self.garray._full_genome_stored:
-                raise ValueError('Indexing with GenomicInterval only possible '
-                                 'when the whole genome (or chromosome) was loaded')
-            # accept a genomic interval directly
-            data = np.zeros((1,) + self.shape[1:])
-            data[0] = self._getsingleitem(idxs)
-            for transform in self.transformations:
-                data = transform(data)
+            if self.garray._full_genome_stored:
+                print(idxs)
+                # accept a genomic interval directly
+                #data = np.zeros((1,) + self.shape[1:])
+                data = self._getsingleitem(idxs)
+                data = data.reshape((1,) + data.shape)
+                for transform in self.transformations:
+                    data = transform(data)
+
+            else:
+                chrom = idxs.chrom
+                start = idxs.start
+                end = idxs.end
+                gindexer_new = self.gindexer.filter_by_region(include=chrom, start=start, end=end)
+                data = np.zeros((1, ((end - start) // self.garray.resolution) + (2 * (gindexer_new.stepsize) // self.garray.resolution)) + self.shape[2:])
+                if self.padding_value != 0:
+                    data.fill(self.padding_value)
+                step_size = gindexer_new.stepsize
+                for interval in gindexer_new:
+                    print('new gindexer interval:', interval)
+                    tmp_data = np.array(self._getsingleitem(interval))
+                    tmp_data = tmp_data.reshape((1,) + tmp_data.shape)
+
+                    if interval.strand == '-':
+                        # invert the data so that is again relative
+                        # to the positive strand,
+                        # this avoids having to change the rel_pos computation
+                        tmp_data = tmp_data[:,::-1,::-1,:]
+
+                    rel_pos = (interval.start - (start - step_size)) // self.garray.resolution
+
+                    data[:, rel_pos: rel_pos + (step_size // self.garray.resolution), :, :] = tmp_data
+
+                if interval.strand == '-':
+                    # invert it back relative to minus strand
+                    data = data[:,::-1,::-1,:]
+
+                data = data[:,(1*(step_size) // self.garray.resolution): -1 * (1*(step_size) // self.garray.resolution),:,:]
+
+            if not self._channel_last:
+                data = np.transpose(data, (0, 3, 1, 2))
+
             return data
 
         try:
@@ -726,34 +938,33 @@ class Cover(Dataset):
         except TypeError:
             raise IndexError('Cover.__getitem__: index must be iterable')
 
-        data = np.zeros((len(idxs),) + self.shape[1:])
+        data = np.zeros((len(idxs),) + self.shape_static[1:])
         if self.padding_value != 0:
             data.fill(self.padding_value)
 
         for i, idx in enumerate(idxs):
             interval = self.gindexer[idx]
 
-            pinterval = interval.copy()
-
-            end = (pinterval.end - pinterval.start) // self.garray.resolution
-
-            data[i, :end, :, :] = self._getsingleitem(pinterval)
+            data[i, :, :, :] = self._getsingleitem(interval)
 
         for transform in self.transformations:
             data = transform(data)
 
+        if not self._channel_last:
+            data = np.transpose(data, (0, 3, 1, 2))
+
         return data
 
     def _getsingleitem(self, pinterval):
-        if self.dimmode == 'all':
-            pinterval.end = pinterval.end
-        elif self.dimmode == 'first':
-            pinterval.end = pinterval.start + self.garray.resolution
 
         if pinterval.strand == '-':
             data = np.asarray(self.garray[pinterval])[::-1, ::-1, :]
         else:
             data = np.asarray(self.garray[pinterval])
+
+        if self.dimmode == 'first':
+            data = data[:1, :, :]
+
         return data
 
     def __len__(self):
@@ -762,6 +973,15 @@ class Cover(Dataset):
     @property
     def shape(self):
         """Shape of the dataset"""
+
+        if self._channel_last:
+            return self.shape_static
+        else:
+            return tuple(self.shape_static[x] for x in [0, 3, 1, 2])
+
+    @property
+    def shape_static(self):
+        """Shape of the dataset"""
         if self.dimmode == 'all':
             blen = (self.gindexer.binsize) // self.garray.resolution
             seqlen = 2*self.gindexer.flank // self.garray.resolution + \
@@ -769,9 +989,155 @@ class Cover(Dataset):
         elif self.dimmode == 'first':
             seqlen = 1
         return (len(self),
-                seqlen, 2 if self.garray.stranded else 1, len(self.garray.condition))
+                seqlen,
+                2 if self.garray.stranded else 1,
+                len(self.garray.condition))
 
     @property
     def conditions(self):
         """Conditions"""
         return [s.decode('utf-8') for s in self.garray.condition]
+
+    def export_to_bigwig(self, output_dir, genomesize=None):
+        """ This method exports the coverage as bigwigs.
+
+        This allows to use a standard genome browser to explore the
+        predictions or features derived from a neural network.
+
+        The bigwig files are named after the container name and the condition
+        names.
+
+        NOTE:
+            This function expects that the regions that need to be
+            exported are non-overlapping. That is the gindexer
+            binsize must be smaller or equal than stepsize.
+
+        Parameters
+        ----------
+        output_dir : str
+            Output directory to which the bigwig files will be exported to.
+        genomesize : dict or None
+            Dictionary containing the genome size.
+            If `genomesize=None`, the genome size
+            is determined from the gindexer if `store_whole_genome=False`,
+            or from the garray-size of `store_whole_genome=True`.
+        """
+
+        if pyBigWig is None:  # pragma: no cover
+            raise Exception('pyBigWig not available. '
+                            '`export_to_bigwig` requires pyBigWig to be installed.')
+
+        resolution = self.garray.resolution
+
+        if genomesize is not None:
+            gsize = genomesize
+        elif self.garray._full_genome_stored:
+            gsize = {k: self.garray.handle[k].shape[0] * resolution \
+                     for k in self.garray.handle}
+        else:
+            gsize = get_genome_size_from_regions(self.gindexer)
+
+        bw_header = [(chrom, gsize[chrom])
+                     for chrom in gsize]
+
+        print('check header:')
+        print(bw_header)
+
+        for idx, condition in enumerate(self.conditions):
+            print(condition)
+            bw_file = pyBigWig.open(os.path.join(
+                output_dir,
+                '{name}.{condition}.bigwig'.format(
+                    name=self.name, condition=condition)), 'w')
+
+            bw_file.addHeader(bw_header)
+
+            # we need the new filter_by_region method here
+            #for chrom, size in bw_header:
+                # ngindexer = self.gindexer.filter_by_region()
+                # then use the new ngindexer to loop over as below
+
+            for ridx, region in enumerate(self.gindexer):
+                print(region)
+                cov = self[ridx][0, :, :, idx].sum(axis=1)
+                #print(region)
+
+                bw_file.addEntries(str(region.chrom),
+                                   int(region.start),
+                                   values=cov,
+                                   span=int(resolution),
+                                   step=int(resolution))
+            bw_file.close()
+
+
+def plotGenomeTrack(covers, chr, start, end):
+
+    """plotGenomeTrack shows plots of a specific interval from cover objects data.
+
+    It takes a list of cover objects, number of chromosome, the start and the end of
+    a required interval and shows a plot of the same interval for each condition of each cover.
+
+    Parameters
+    ----------
+    covers : list(str)
+        List of cover objects.
+    chr : str
+        chromosome name.
+    start : int
+        The start of the required interval.
+    end : int
+        The end of the required interval.
+
+    Returns
+    -------
+    Figure
+        A matplotlib figure built for the required interval for each condition of each cover objects.
+        It is possible to show that figure with show() function integrated in matplotlib or even save it
+        with the 'savefig()' function of the same library.
+    """
+    if not isinstance(covers, list):
+        covers = [covers]
+
+    n_covers = len(covers)
+    color = iter(cm.rainbow(np.linspace(0, 1, n_covers)))
+    data = covers[0][chr, start, end]
+    len_files = [len(cover.conditions) for cover in covers]
+    nfiles = np.sum(len_files)
+    grid = plt.GridSpec(2 + (nfiles * 3) + (n_covers - 1), 10, wspace=0.4, hspace=0.3)
+    fig = plt.figure(figsize=(1 + nfiles * 3, 2*nfiles))
+
+    title = fig.add_subplot(grid[0, 1:])
+    title.set_title(chr)
+    plt.xlim([0, len(data[0, :, 0, 0])])
+    title.spines['right'].set_visible(False)
+    title.spines['top'].set_visible(False)
+    title.spines['left'].set_visible(False)
+    plt.xticks([0, len(data[0, :, 0, 0])], [start, end])
+    plt.yticks(())
+    cover_start = 2
+    abs_cont = 0
+    lat_titles = [None]*len(covers)
+    plots = []
+    for j, cover in enumerate(covers):
+        color_ = next(color)
+        lat_titles[j] = fig.add_subplot(grid[(cover_start + j):(cover_start + len_files[j]*3) + j, 0])
+        cover_start += (len_files[j]*3)
+        lat_titles[j].set_xticks(())
+        lat_titles[j].spines['right'].set_visible(False)
+        lat_titles[j].spines['top'].set_visible(False)
+        lat_titles[j].spines['bottom'].set_visible(False)
+        lat_titles[j].set_yticks([0.5])
+        lat_titles[j].set_yticklabels([cover.name], color=color_)
+        cont = 0
+        for i in cover.conditions:
+            plots.append(fig.add_subplot(grid[(cont + abs_cont) * 3 + 2 +j:(cont + abs_cont) * 3 + 5+j, 1:]))
+            plots[-1].plot(data[0, :, 0, cont], linewidth=2, color = color_)
+            plots[-1].set_yticks(())
+            plots[-1].set_xticks(())
+            plots[-1].set_xlim([0, len(data[0, :, 0, 0])])
+            plots[-1].set_ylabel(i, labelpad=12)
+            plots[-1].spines['right'].set_visible(False)
+            plots[-1].spines['top'].set_visible(False)
+            cont = cont + 1
+        abs_cont += cont
+    return (fig)

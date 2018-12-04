@@ -42,10 +42,9 @@ class GenomicArray(object):  # pylint: disable=too-many-instance-attributes
     _condition = None
     _resolution = None
     _order = None
-    _full_genome_stored = True
 
     def __init__(self, stranded=True, conditions=None, typecode='d',
-                 resolution=1, order=1):
+                 resolution=1, order=1, store_whole_genome=True):
         self.stranded = stranded
         if conditions is None:
             conditions = ['sample']
@@ -58,6 +57,7 @@ class GenomicArray(object):  # pylint: disable=too-many-instance-attributes
             raise Exception('order support only up to order=4.')
         self.resolution = resolution
         self.typecode = typecode
+        self._full_genome_stored = store_whole_genome
 
     def __setitem__(self, index, value):
         interval = index[0]
@@ -65,12 +65,34 @@ class GenomicArray(object):  # pylint: disable=too-many-instance-attributes
         if isinstance(interval, GenomicInterval) and isinstance(condition, int):
             chrom = interval.chrom
             start = interval.start // self.resolution
-            end = interval.end // self.resolution
+            end = int(numpy.ceil(interval.end / self.resolution))
             strand = interval.strand
 
-            self.handle[chrom][start:end,
-                               1 if self.stranded and strand == '-' else 0,
-                               condition] = value
+            try:
+                if not self._full_genome_stored:
+                    length = end-start
+                    # correcting for the overshooting starts and ends is not necessary
+                    # for partially loaded data
+
+                    self.handle[_iv_to_str(chrom, interval.start,
+                                           interval.end)][:(length),
+                                           1 if self.stranded and strand == '-' else 0,
+                                           condition] = value
+#                       raise IndexError('Region {} not '.format(_iv_to_str(
+#                               chrom, interval.start, interval.end)) +
+#                                        'contained in the genomic array. '
+#                                        'Consider adjusting the regions, '
+#                                        'binsize, stepsize and flank.')
+
+                else:
+                    self.handle[chrom][start:end,
+                                       1 if self.stranded and strand == '-' else 0,
+                                       condition] = value
+            except KeyError:
+                print('Skipping region {} - not in genomic array.'.format(
+                    _iv_to_str(chrom, interval.start, interval.end)) + 
+                'Consider using store_whole_genome=True or '
+                'adjusting adjusting the regions, binsize, stepsize and flank.')
 
         else:
             raise IndexError("Index must be a GenomicInterval and a condition index")
@@ -81,7 +103,7 @@ class GenomicArray(object):  # pylint: disable=too-many-instance-attributes
             interval = index
             chrom = interval.chrom
             start = interval.start // self.resolution
-            end = interval.end // self.resolution
+            end = int(numpy.ceil(interval.end / self.resolution))
 
             # original length
             length = end-start
@@ -187,6 +209,9 @@ class HDF5GenomicArray(GenomicArray):
         with Cover Datasets. Default: 1.
     order : int
         Order of the alphabet size. Only relevant for Bioseq Datasets. Default: 1.
+    store_whole_genome : boolean
+        Whether to store the entire genome or only the regions of interest.
+        Default: True
     cache : boolean
         Whether to cache the dataset. Default: True
     overwrite : boolean
@@ -203,11 +228,13 @@ class HDF5GenomicArray(GenomicArray):
                  typecode='d',
                  datatags=None,
                  resolution=1,
-                 order=1, cache=True,
+                 order=1,
+                 store_whole_genome=True,
+                 cache=True,
                  overwrite=False, loader=None, loader_args=None):
         super(HDF5GenomicArray, self).__init__(stranded, conditions, typecode,
                                                resolution,
-                                               order)
+                                               order, store_whole_genome)
 
         if not cache:
             raise ValueError('HDF5 format requires cache=True')
@@ -225,7 +252,7 @@ class HDF5GenomicArray(GenomicArray):
             self.handle = h5py.File(os.path.join(memmap_dir, filename), 'w')
 
             for chrom in chroms:
-                shape = (chroms[chrom] // self.resolution + 1,
+                shape = (int(numpy.ceil(chroms[chrom] / self.resolution)),
                          2 if stranded else 1, len(self.condition))
                 self.handle.create_dataset(chrom, shape,
                                            dtype=self.typecode, compression='gzip',
@@ -271,6 +298,9 @@ class NPGenomicArray(GenomicArray):
         with Cover Datasets. Default: 1.
     order : int
         Order of the alphabet size. Only relevant for Bioseq Datasets. Default: 1.
+    store_whole_genome : boolean
+        Whether to store the entire genome or only the regions of interest.
+        Default: True
     cache : boolean
         Specifies whether to cache the dataset. Default: True
     overwrite : boolean
@@ -287,12 +317,14 @@ class NPGenomicArray(GenomicArray):
                  typecode='d',
                  datatags=None,
                  resolution=1,
-                 order=1, cache=True,
+                 order=1,
+                 store_whole_genome=True,
+                 cache=True,
                  overwrite=False, loader=None, loader_args=None):
 
         super(NPGenomicArray, self).__init__(stranded, conditions, typecode,
                                              resolution,
-                                             order)
+                                             order, store_whole_genome)
 
         if stranded:
             datatags = datatags + ['stranded'] if datatags else ['stranded']
@@ -305,7 +337,7 @@ class NPGenomicArray(GenomicArray):
 
         if cache and not os.path.exists(os.path.join(memmap_dir, filename)) \
                 or overwrite or not cache:
-            data = {chrom: numpy.zeros(shape=(chroms[chrom] // self.resolution + 1,
+            data = {chrom: numpy.zeros(shape=(int(numpy.ceil(chroms[chrom] / self.resolution)),
                                               2 if stranded else 1,
                                               len(self.condition)),
                                        dtype=self.typecode) for chrom in chroms}
@@ -365,6 +397,9 @@ class SparseGenomicArray(GenomicArray):
         with Cover Datasets. Default: 1.
     order : int
         Order of the alphabet size. Only relevant for Bioseq Datasets. Default: 1.
+    store_whole_genome : boolean
+        Whether to store the entire genome or only the regions of interest.
+        Default: True
     cache : boolean
         Whether to cache the dataset. Default: True
     overwrite : boolean
@@ -381,12 +416,14 @@ class SparseGenomicArray(GenomicArray):
                  typecode='d',
                  datatags=None,
                  resolution=1,
-                 order=1, cache=True,
+                 order=1,
+                 store_whole_genome=True,
+                 cache=True,
                  overwrite=False, loader=None, loader_args=None):
         super(SparseGenomicArray, self).__init__(stranded, conditions,
                                                  typecode,
                                                  resolution,
-                                                 order)
+                                                 order, store_whole_genome)
 
         if stranded:
             datatags = datatags + ['stranded'] if datatags else ['stranded']
@@ -398,7 +435,7 @@ class SparseGenomicArray(GenomicArray):
             os.makedirs(memmap_dir)
         if cache and not os.path.exists(os.path.join(memmap_dir, filename)) \
             or overwrite or not cache:
-            data = {chrom: sparse.dok_matrix((chroms[chrom] // self.resolution + 1,
+            data = {chrom: sparse.dok_matrix((int(numpy.ceil(chroms[chrom] / self.resolution)),
                                               (2 if stranded else 1) *
                                               len(self.condition)),
                                              dtype=self.typecode)
@@ -455,7 +492,7 @@ class SparseGenomicArray(GenomicArray):
         if isinstance(interval, GenomicInterval) and isinstance(condition, int):
             chrom = interval.chrom
             start = interval.start // self.resolution
-            end = interval.end // self.resolution
+            end = int(numpy.ceil(interval.end / self.resolution))
             strand = interval.strand
             sind = 1 if self.stranded and strand == '-' else 0
 
@@ -468,9 +505,15 @@ class SparseGenomicArray(GenomicArray):
                     val = value
 
                 if val > 0:
-                    self.handle[chrom][iarray,
-                                       sind * len(self.condition)
-                                       + condition] = val
+                    if not self._full_genome_stored:
+                        self.handle[_iv_to_str(chrom, interval.start,
+                                               interval.end)][idx,
+                                               sind * len(self.condition)
+                                               + condition] = val
+                    else:
+                        self.handle[chrom][iarray,
+                                           sind * len(self.condition)
+                                           + condition] = val
 
             return
         raise IndexError("Index must be a GenomicInterval and a condition index")
@@ -482,6 +525,7 @@ class SparseGenomicArray(GenomicArray):
 def create_genomic_array(chroms, stranded=True, conditions=None, typecode='int',
                          storage='hdf5', resolution=1,
                          order=1,
+                         store_whole_genome=True,
                          datatags=None, cache=True, overwrite=False,
                          loader=None, loader_args=None):
     """Factory function for creating a GenomicArray.
@@ -518,6 +562,9 @@ def create_genomic_array(chroms, stranded=True, conditions=None, typecode='int',
         with Cover Datasets. Default: 1.
     order : int
         Order of the alphabet size. Only relevant for Bioseq Datasets. Default: 1.
+    store_whole_genome : boolean
+        Whether to store the entire genome or only the regions of interest.
+        Default: True
     cache : boolean
         Whether to cache the dataset. Default: True
     overwrite : boolean
@@ -535,6 +582,7 @@ def create_genomic_array(chroms, stranded=True, conditions=None, typecode='int',
                                 datatags=datatags,
                                 resolution=resolution,
                                 order=order,
+                                store_whole_genome=store_whole_genome,
                                 cache=cache,
                                 overwrite=overwrite,
                                 loader=loader,
@@ -546,6 +594,7 @@ def create_genomic_array(chroms, stranded=True, conditions=None, typecode='int',
                               datatags=datatags,
                               resolution=resolution,
                               order=order,
+                              store_whole_genome=store_whole_genome,
                               cache=cache,
                               overwrite=overwrite,
                               loader=loader,
@@ -557,6 +606,7 @@ def create_genomic_array(chroms, stranded=True, conditions=None, typecode='int',
                                   datatags=datatags,
                                   resolution=resolution,
                                   order=order,
+                                  store_whole_genome=store_whole_genome,
                                   cache=cache,
                                   overwrite=overwrite,
                                   loader=loader,
